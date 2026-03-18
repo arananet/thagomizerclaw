@@ -1,0 +1,356 @@
+openapi: "3.1.0"
+
+info:
+  title: ThagomizerClaw Admin API
+  version: "1.0.0"
+  description: |
+    Internal administration API for ThagomizerClaw (Cloudflare Workers).
+
+    **Authentication**: All admin endpoints require `Authorization: Bearer {ADMIN_SECRET}`.
+    Set `ADMIN_SECRET` via `wrangler secret put ADMIN_SECRET`.
+    If `ADMIN_SECRET` is not set, the system falls back to `WEBHOOK_SECRET` (migration path only).
+
+    **Base URL**: `https://<your-worker>.workers.dev`
+
+    **Zero Trust note**: The admin API and webhook URL secrets MUST be different values.
+    Use `ADMIN_SECRET` for the admin API and `WEBHOOK_SECRET` for the Telegram webhook path only.
+
+servers:
+  - url: https://{worker}.workers.dev
+    description: Production Cloudflare Worker
+    variables:
+      worker:
+        default: thagomizer-claw
+        description: Cloudflare Worker subdomain
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        Bearer token must equal `ADMIN_SECRET` (preferred) or `WEBHOOK_SECRET` (fallback).
+        Set via `wrangler secret put ADMIN_SECRET`.
+
+  schemas:
+    AgentConfig:
+      type: object
+      properties:
+        model:
+          type: string
+          example: claude-opus-4-6
+          description: Anthropic model ID to use for this group.
+        maxTokens:
+          type: integer
+          minimum: 1
+          maximum: 8192
+          example: 4096
+        timeout:
+          type: integer
+          description: Per-group agent timeout override in milliseconds.
+          example: 60000
+        useWorkersAI:
+          type: boolean
+          description: Route this group to Workers AI instead of the Claude API.
+          default: false
+
+    RegisteredGroup:
+      type: object
+      required:
+        - name
+        - folder
+        - trigger
+        - added_at
+      properties:
+        name:
+          type: string
+          example: "Engineering Team"
+        folder:
+          type: string
+          description: Unique filesystem-safe identifier used as R2/KV key prefix.
+          example: "engineering"
+        trigger:
+          type: string
+          description: Trigger prefix pattern (e.g. "@Andy").
+          example: "@Andy"
+        added_at:
+          type: string
+          format: date-time
+          example: "2024-01-15T10:00:00Z"
+        requiresTrigger:
+          type: boolean
+          default: true
+          description: If false, agent processes all messages without trigger prefix.
+        isMain:
+          type: boolean
+          default: false
+          description: If true, this group has elevated admin privileges.
+        agentConfig:
+          $ref: "#/components/schemas/AgentConfig"
+
+    ScheduledTask:
+      type: object
+      required:
+        - id
+        - group_folder
+        - chat_jid
+        - prompt
+        - schedule_type
+        - schedule_value
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          example: "task_abc123"
+        group_folder:
+          type: string
+          example: "engineering"
+        chat_jid:
+          type: string
+          description: Channel-specific JID (e.g. tg:123456789).
+          example: "tg:123456789"
+        prompt:
+          type: string
+          example: "Send a daily standup reminder."
+        schedule_type:
+          type: string
+          enum: [cron, interval, once]
+        schedule_value:
+          type: string
+          description: >
+            For `cron`: a 5-field cron expression (e.g. "0 9 * * 1-5").
+            For `interval`: milliseconds as a string (e.g. "3600000").
+            For `once`: ISO 8601 datetime string.
+          example: "0 9 * * 1-5"
+        context_mode:
+          type: string
+          enum: [group, isolated]
+          default: group
+        next_run:
+          type: string
+          format: date-time
+          nullable: true
+        last_run:
+          type: string
+          format: date-time
+          nullable: true
+        last_result:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [active, paused, completed]
+        created_at:
+          type: string
+          format: date-time
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - db
+        - assistant
+        - environment
+        - timestamp
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          example: ok
+        db:
+          type: string
+          enum: [ok, error]
+          description: D1 database connectivity status.
+          example: ok
+        assistant:
+          type: string
+          example: Andy
+        environment:
+          type: string
+          example: production
+        timestamp:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Unauthorized
+
+paths:
+  /health:
+    get:
+      summary: Public health check
+      description: >
+        Minimal liveness probe. Does NOT require authentication.
+        Does NOT return detailed system status (use `/admin/health` for that).
+      security: []
+      tags: [Health]
+      responses:
+        "200":
+          description: Worker is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: thagomizer_claw
+                  status:
+                    type: string
+                    example: ok
+
+  /admin/health:
+    get:
+      summary: Detailed health check (authenticated)
+      description: Returns D1 connectivity, assistant configuration, and environment.
+      tags: [Health]
+      responses:
+        "200":
+          description: Health status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "401":
+          description: Missing or invalid Bearer token.
+
+  /admin/groups:
+    get:
+      summary: List registered groups
+      description: Returns all groups registered in D1 as a map of JID → RegisteredGroup.
+      tags: [Groups]
+      responses:
+        "200":
+          description: Map of JID → RegisteredGroup.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: "#/components/schemas/RegisteredGroup"
+                example:
+                  "tg:123456789":
+                    name: "Engineering Team"
+                    folder: "engineering"
+                    trigger: "@Andy"
+                    added_at: "2024-01-15T10:00:00Z"
+                    requiresTrigger: true
+                    isMain: false
+        "401":
+          description: Missing or invalid Bearer token.
+
+    post:
+      summary: Register or update a group
+      description: >
+        Create or replace the registration for a chat JID.
+        If the group already exists, this fully replaces its configuration.
+      tags: [Groups]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - jid
+                - group
+              properties:
+                jid:
+                  type: string
+                  description: Channel-specific JID (e.g. tg:chatId, dc:guildId:channelId).
+                  example: "tg:123456789"
+                group:
+                  $ref: "#/components/schemas/RegisteredGroup"
+      responses:
+        "200":
+          description: Group registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        "400":
+          description: Invalid request body.
+        "401":
+          description: Missing or invalid Bearer token.
+        "413":
+          description: Request body exceeds 1 MiB limit.
+
+  /admin/tasks:
+    get:
+      summary: List scheduled tasks
+      description: Returns all scheduled tasks across all groups.
+      tags: [Tasks]
+      responses:
+        "200":
+          description: Array of scheduled tasks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ScheduledTask"
+        "401":
+          description: Missing or invalid Bearer token.
+
+  /admin/send:
+    post:
+      summary: Send a message to a chat
+      description: >
+        Send an arbitrary text message to any registered JID.
+        Use with caution — this bypasses the normal agent pipeline.
+      tags: [Messaging]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - jid
+                - text
+              properties:
+                jid:
+                  type: string
+                  description: Target JID.
+                  example: "tg:123456789"
+                text:
+                  type: string
+                  description: Message text to send.
+                  example: "System maintenance in 5 minutes."
+      responses:
+        "200":
+          description: Message sent.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        "401":
+          description: Missing or invalid Bearer token.
+        "413":
+          description: Request body exceeds 1 MiB limit.
+
+tags:
+  - name: Health
+    description: Health and readiness probes
+  - name: Groups
+    description: Registered group management
+  - name: Tasks
+    description: Scheduled task management
+  - name: Messaging
+    description: Direct message sending

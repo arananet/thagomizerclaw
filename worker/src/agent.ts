@@ -48,6 +48,7 @@ interface AnthropicResponse {
 async function callClaudeAPI(
   apiKey: string,
   request: AnthropicRequest,
+  timeoutMs: number,
 ): Promise<AnthropicResponse> {
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -57,11 +58,12 @@ async function callClaudeAPI(
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(request),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Anthropic API error ${response.status}: ${error}`);
+    // Avoid leaking response body (may contain quota/key details) — only surface status code
+    throw new Error(`Anthropic API error ${response.status}`);
   }
 
   return response.json() as Promise<AnthropicResponse>;
@@ -120,6 +122,7 @@ export async function runAgent(
   const systemPrompt = buildSystemPrompt(input);
   const maxTokens = input.agentConfig?.maxTokens ?? DEFAULT_MAX_TOKENS;
   const useWorkersAI = input.agentConfig?.useWorkersAI ?? false;
+  const timeoutMs = input.agentConfig?.timeout ?? parseInt(env.AGENT_TIMEOUT_MS ?? '120000', 10);
 
   // Workers AI path (cheaper/faster for simple queries)
   if (useWorkersAI) {
@@ -148,7 +151,7 @@ export async function runAgent(
       messages: [{ role: 'user', content: input.prompt }],
     };
 
-    const response = await callClaudeAPI(env.ANTHROPIC_API_KEY, request);
+    const response = await callClaudeAPI(env.ANTHROPIC_API_KEY, request, timeoutMs);
 
     const text = response.content
       .filter((c) => c.type === 'text')

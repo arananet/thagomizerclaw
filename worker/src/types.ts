@@ -43,6 +43,12 @@ export interface Env {
   SLACK_BOT_TOKEN?: string;
   SLACK_SIGNING_SECRET?: string;
   WEBHOOK_SECRET: string;
+  /**
+   * Dedicated secret for admin API Bearer auth (Zero Trust: separate from WEBHOOK_SECRET).
+   * If not set, falls back to WEBHOOK_SECRET for backward compatibility.
+   * Set via: wrangler secret put ADMIN_SECRET
+   */
+  ADMIN_SECRET?: string;
 }
 
 // ─── Domain Types ────────────────────────────────────────────────────────────

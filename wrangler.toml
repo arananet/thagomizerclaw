@@ -81,7 +81,12 @@ crons = [
 #   DISCORD_PUBLIC_KEY         — Discord app public key (for webhook verification)
 #   SLACK_BOT_TOKEN            — Slack bot OAuth token (if using Slack channel)
 #   SLACK_SIGNING_SECRET       — Slack signing secret (for request verification)
-#   WEBHOOK_SECRET             — Shared secret for authenticating internal webhooks
+#   WEBHOOK_SECRET             — Telegram webhook URL path token (platform auth)
+#
+# Zero Trust — separate admin API credential (strongly recommended):
+#   ADMIN_SECRET               — Bearer token for /admin/* endpoints
+#                                If not set, falls back to WEBHOOK_SECRET (migration only).
+#                                Run: wrangler secret put ADMIN_SECRET
 
 # ────────────────────────────────────────────────────────────────────────────
 # Environment variables (non-secret configuration)

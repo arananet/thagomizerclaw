@@ -1,785 +1,543 @@
-# NanoClaw Specification
+# ThagomizerClaw Specification
 
-A personal Claude assistant with multi-channel support, persistent memory per conversation, scheduled tasks, and container-isolated agent execution.
+Enterprise Claude assistant on Cloudflare Workers. Multi-channel, globally distributed, zero-infrastructure.
+
+*Forked from NanoClaw — Eduardo Arana & Soda 🥤*
+
+For the spec-driven development process, see [SDD.md](SDD.md).
+For governing principles, see [CONSTITUTION.md](../CONSTITUTION.md).
 
 ---
 
 ## Table of Contents
 
-1. [Architecture](#architecture)
-2. [Architecture: Channel System](#architecture-channel-system)
-3. [Folder Structure](#folder-structure)
-4. [Configuration](#configuration)
-5. [Memory System](#memory-system)
-6. [Session Management](#session-management)
-7. [Message Flow](#message-flow)
-8. [Commands](#commands)
+1. [Architecture Overview](#architecture-overview)
+2. [Cloudflare Bindings](#cloudflare-bindings)
+3. [Data Model](#data-model)
+4. [Channel System](#channel-system)
+5. [Message Flow](#message-flow)
+6. [Agent Execution](#agent-execution)
+7. [Memory System](#memory-system)
+8. [Session Management](#session-management)
 9. [Scheduled Tasks](#scheduled-tasks)
-10. [MCP Servers](#mcp-servers)
-11. [Deployment](#deployment)
-12. [Security Considerations](#security-considerations)
+10. [Group Management](#group-management)
+11. [Admin API](#admin-api)
+12. [Durable Objects](#durable-objects)
+13. [Security Model](#security-model)
+14. [Deployment](#deployment)
+15. [Node.js Reference Mode](#nodejs-reference-mode)
 
 ---
 
-## Architecture
+## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        HOST (macOS / Linux)                           │
-│                     (Main Node.js Process)                            │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  ┌──────────────────┐                  ┌────────────────────┐        │
-│  │ Channels         │─────────────────▶│   SQLite Database  │        │
-│  │ (self-register   │◀────────────────│   (messages.db)    │        │
-│  │  at startup)     │  store/send      └─────────┬──────────┘        │
-│  └──────────────────┘                            │                   │
-│                                                   │                   │
-│         ┌─────────────────────────────────────────┘                   │
-│         │                                                             │
-│         ▼                                                             │
-│  ┌──────────────────┐    ┌──────────────────┐    ┌───────────────┐   │
-│  │  Message Loop    │    │  Scheduler Loop  │    │  IPC Watcher  │   │
-│  │  (polls SQLite)  │    │  (checks tasks)  │    │  (file-based) │   │
-│  └────────┬─────────┘    └────────┬─────────┘    └───────────────┘   │
-│           │                       │                                   │
-│           └───────────┬───────────┘                                   │
-│                       │ spawns container                              │
-│                       ▼                                               │
-├──────────────────────────────────────────────────────────────────────┤
-│                     CONTAINER (Linux VM)                               │
-├──────────────────────────────────────────────────────────────────────┤
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │                    AGENT RUNNER                               │    │
-│  │                                                                │    │
-│  │  Working directory: /workspace/group (mounted from host)       │    │
-│  │  Volume mounts:                                                │    │
-│  │    • groups/{name}/ → /workspace/group                         │    │
-│  │    • groups/global/ → /workspace/global/ (non-main only)       │    │
-│  │    • data/sessions/{group}/.claude/ → /home/node/.claude/      │    │
-│  │    • Additional dirs → /workspace/extra/*                      │    │
-│  │                                                                │    │
-│  │  Tools (all groups):                                           │    │
-│  │    • Bash (safe - sandboxed in container!)                     │    │
-│  │    • Read, Write, Edit, Glob, Grep (file operations)           │    │
-│  │    • WebSearch, WebFetch (internet access)                     │    │
-│  │    • agent-browser (browser automation)                        │    │
-│  │    • mcp__nanoclaw__* (scheduler tools via IPC)                │    │
-│  │                                                                │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Cloudflare Network Edge                          │
+│                                                                      │
+│  ┌──────────────┐  ┌───────────────┐  ┌──────────────────────────┐  │
+│  │   Telegram   │  │    Discord    │  │         Slack            │  │
+│  │   Webhook    │  │    Webhook    │  │        Webhook           │  │
+│  │  (URL token) │  │   (Ed25519)   │  │      (HMAC-SHA256)       │  │
+│  └──────┬───────┘  └───────┬───────┘  └────────────┬─────────────┘  │
+│         └──────────────────▼──────────────────────-─┘               │
+│                             │                                        │
+│                 ┌───────────▼──────────┐                             │
+│                 │   Worker fetch()     │  ← verify sig               │
+│                 │   worker/src/index   │  ← store message to D1      │
+│                 └───────────┬──────────┘  ← enqueue to Queue         │
+│                             │                                        │
+│                 ┌───────────▼──────────┐                             │
+│                 │   Cloudflare Queue   │  (async, retryable)         │
+│                 └───────────┬──────────┘                             │
+│                             │                                        │
+│                 ┌───────────▼──────────┐                             │
+│                 │   Worker queue()     │  ← load group config        │
+│                 │   consumer           │  ← load CLAUDE.md from R2   │
+│                 └───────────┬──────────┘  ← call Claude / Workers AI │
+│                             │             ← send reply via channel   │
+│  ┌──────────────────────────▼─────────────────────────────────────┐  │
+│  │                  Cloudflare Primitives                          │  │
+│  │  D1 (SQLite)  │  R2 (objects)  │  KV (hot state)               │  │
+│  │  Durable Objects (group state) │  Workers AI (LLM fallback)    │  │
+│  │  Cron Triggers (scheduled tasks, every minute)                  │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Technology Stack
 
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| Channel System | Channel registry (`src/channels/registry.ts`) | Channels self-register at startup |
-| Message Storage | SQLite (better-sqlite3) | Store messages for polling |
-| Container Runtime | Containers (Linux VMs) | Isolated environments for agent execution |
-| Agent | @anthropic-ai/claude-agent-sdk (0.2.29) | Run Claude with tools and MCP servers |
-| Browser Automation | agent-browser + Chromium | Web interaction and screenshots |
-| Runtime | Node.js 20+ | Host process for routing and scheduling |
+| Concern | Cloudflare Primitive | Notes |
+|---------|---------------------|-------|
+| Code execution | Workers (V8 isolate) | Serverless, ~0ms cold start |
+| Primary database | D1 (SQLite) | Global replication |
+| Object storage | R2 | CLAUDE.md files, logs |
+| Hot state | KV | Cursors, sessions (sub-ms reads) |
+| Async processing | Queues | Webhook → agent decoupling |
+| Stateful coordination | Durable Objects | Per-group lock + queue |
+| Rate limiting | Durable Objects | Sliding window per group |
+| LLM inference | Workers AI | Llama/Mistral fallback |
+| Secrets | Cloudflare Secrets | Encrypted at rest, never in code |
+| Scheduling | Cron Triggers | `* * * * *` for task processing |
 
 ---
 
-## Architecture: Channel System
+## Cloudflare Bindings
 
-The core ships with no channels built in — each channel (WhatsApp, Telegram, Slack, Discord, Gmail) is installed as a [Claude Code skill](https://code.claude.com/docs/en/skills) that adds the channel code to your fork. Channels self-register at startup; installed channels with missing credentials emit a WARN log and are skipped.
-
-### System Diagram
-
-```mermaid
-graph LR
-    subgraph Channels["Channels"]
-        WA[WhatsApp]
-        TG[Telegram]
-        SL[Slack]
-        DC[Discord]
-        New["Other Channel (Signal, Gmail...)"]
-    end
-
-    subgraph Orchestrator["Orchestrator — index.ts"]
-        ML[Message Loop]
-        GQ[Group Queue]
-        RT[Router]
-        TS[Task Scheduler]
-        DB[(SQLite)]
-    end
-
-    subgraph Execution["Container Execution"]
-        CR[Container Runner]
-        LC["Linux Container"]
-        IPC[IPC Watcher]
-    end
-
-    %% Flow
-    WA & TG & SL & DC & New -->|onMessage| ML
-    ML --> GQ
-    GQ -->|concurrency| CR
-    CR --> LC
-    LC -->|filesystem IPC| IPC
-    IPC -->|tasks & messages| RT
-    RT -->|Channel.sendMessage| Channels
-    TS -->|due tasks| CR
-
-    %% DB Connections
-    DB <--> ML
-    DB <--> TS
-
-    %% Styling for the dynamic channel
-    style New stroke-dasharray: 5 5,stroke-width:2px
-```
-
-### Channel Registry
-
-The channel system is built on a factory registry in `src/channels/registry.ts`:
+Defined in `wrangler.toml`. Accessed via `env.*` in Worker code.
 
 ```typescript
-export type ChannelFactory = (opts: ChannelOpts) => Channel | null;
+interface Env {
+  // Data
+  DB: D1Database;
+  STORAGE: R2Bucket;
+  STATE: KVNamespace;
 
-const registry = new Map<string, ChannelFactory>();
+  // Compute
+  MESSAGE_QUEUE: Queue<QueueMessage>;
+  AI: Ai;
+  GROUP_SESSION: DurableObjectNamespace;
+  RATE_LIMITER: DurableObjectNamespace;
 
-export function registerChannel(name: string, factory: ChannelFactory): void {
-  registry.set(name, factory);
-}
+  // Non-secret config (wrangler.toml [vars])
+  ASSISTANT_NAME: string;       // Trigger name, default "Andy"
+  ENVIRONMENT: string;
+  LOG_LEVEL: string;
+  MAX_CONCURRENT_AGENTS: string;
+  AGENT_TIMEOUT_MS: string;
+  WORKER_AI_MODEL: string;      // Workers AI fallback model
 
-export function getChannelFactory(name: string): ChannelFactory | undefined {
-  return registry.get(name);
-}
-
-export function getRegisteredChannelNames(): string[] {
-  return [...registry.keys()];
+  // Secrets (wrangler secret put — NEVER in code)
+  ANTHROPIC_API_KEY: string;
+  WEBHOOK_SECRET: string;       // Telegram URL path + admin API auth
+  TELEGRAM_BOT_TOKEN?: string;
+  DISCORD_BOT_TOKEN?: string;
+  DISCORD_PUBLIC_KEY?: string;
+  SLACK_BOT_TOKEN?: string;
+  SLACK_SIGNING_SECRET?: string;
 }
 ```
 
-Each factory receives `ChannelOpts` (callbacks for `onMessage`, `onChatMetadata`, and `registeredGroups`) and returns either a `Channel` instance or `null` if that channel's credentials are not configured.
+---
 
-### Channel Interface
+## Data Model
 
-Every channel implements this interface (defined in `src/types.ts`):
+### D1 Tables (see `migrations/0001_initial.sql`)
+
+```sql
+-- Chat/group metadata
+chats (jid PK, name, last_message_time, channel, is_group)
+
+-- All inbound messages
+messages (id + chat_jid PK, sender, sender_name, content, timestamp,
+          is_from_me, is_bot_message)
+
+-- Registered groups (groups the agent responds in)
+registered_groups (jid PK, name, folder UNIQUE, trigger_pattern, added_at,
+                   agent_config JSON, requires_trigger, is_main)
+
+-- Per-group Claude session IDs
+sessions (group_folder PK, session_id, updated_at)
+
+-- Scheduled tasks
+scheduled_tasks (id PK, group_folder, chat_jid, prompt,
+                 schedule_type, schedule_value, context_mode,
+                 next_run, last_run, last_result, status, created_at)
+
+-- Task execution history
+task_run_logs (id AUTOINCREMENT, task_id FK, run_at, duration_ms,
+               status, result, error)
+```
+
+### R2 Key Space
+
+```
+groups/{folder}/CLAUDE.md           Group memory (writable by agent)
+groups/{folder}/logs/{ts}.json      Agent run logs (auto-expire 30d)
+groups/global/CLAUDE.md             Global memory (read-only for non-main)
+sessions/{folder}/.claude/settings.json  Claude settings per group
+config/sender-allowlist.json        Optional sender filtering config
+```
+
+### KV Key Space
+
+```
+cursor:{chatJid}         Last processed message timestamp (string ISO)
+session:{groupFolder}    Session ID (TTL 7 days)
+router_state:{key}       General router state (string values)
+```
+
+---
+
+## Channel System
+
+### Supported Channels
+
+| Channel | JID Format | Webhook Path | Verification |
+|---------|-----------|--------------|-------------|
+| Telegram | `tg:{chatId}` | `/webhook/telegram/{WEBHOOK_SECRET}` | URL path token |
+| Discord | `dc:{guildId}:{channelId}` | `/webhook/discord` | Ed25519 signature |
+| Slack | `sl:{teamId}:{channelId}` | `/webhook/slack` | HMAC-SHA256 |
+
+### Adding a Channel
+
+Each channel is implemented in `worker/src/channels/{name}.ts` and MUST provide:
 
 ```typescript
-interface Channel {
-  name: string;
-  connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
-  isConnected(): boolean;
-  ownsJid(jid: string): boolean;
-  disconnect(): Promise<void>;
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
-  syncGroups?(force: boolean): Promise<void>;
+// JID utilities
+buildXxxJid(id: string): string       // → "xx:{id}"
+ownsXxxJid(jid: string): boolean      // → jid.startsWith('xx:')
+
+// Verification
+verifyXxxWebhook(req, body, env): Promise<boolean>
+
+// Parsing
+parseXxxWebhook(payload): ParsedWebhookEvent | null
+
+// Sending
+sendXxxMessage(channelId, text, env): Promise<void>
+```
+
+The Worker's `sendMessage(jid, text, env)` function MUST be updated to route to the new channel's send function.
+
+### ParsedWebhookEvent
+
+```typescript
+interface ParsedWebhookEvent {
+  chatJid: string;
+  message: NewMessage;
+  channel: 'telegram' | 'discord' | 'slack';
+  sendTyping?: () => Promise<void>;
 }
 ```
-
-### Self-Registration Pattern
-
-Channels self-register using a barrel-import pattern:
-
-1. Each channel skill adds a file to `src/channels/` (e.g. `whatsapp.ts`, `telegram.ts`) that calls `registerChannel()` at module load time:
-
-   ```typescript
-   // src/channels/whatsapp.ts
-   import { registerChannel, ChannelOpts } from './registry.js';
-
-   export class WhatsAppChannel implements Channel { /* ... */ }
-
-   registerChannel('whatsapp', (opts: ChannelOpts) => {
-     // Return null if credentials are missing
-     if (!existsSync(authPath)) return null;
-     return new WhatsAppChannel(opts);
-   });
-   ```
-
-2. The barrel file `src/channels/index.ts` imports all channel modules, triggering registration:
-
-   ```typescript
-   import './whatsapp.js';
-   import './telegram.js';
-   // ... each skill adds its import here
-   ```
-
-3. At startup, the orchestrator (`src/index.ts`) loops through registered channels and connects whichever ones return a valid instance:
-
-   ```typescript
-   for (const name of getRegisteredChannelNames()) {
-     const factory = getChannelFactory(name);
-     const channel = factory?.(channelOpts);
-     if (channel) {
-       await channel.connect();
-       channels.push(channel);
-     }
-   }
-   ```
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `src/channels/registry.ts` | Channel factory registry |
-| `src/channels/index.ts` | Barrel imports that trigger channel self-registration |
-| `src/types.ts` | `Channel` interface, `ChannelOpts`, message types |
-| `src/index.ts` | Orchestrator — instantiates channels, runs message loop |
-| `src/router.ts` | Finds the owning channel for a JID, formats messages |
-
-### Adding a New Channel
-
-To add a new channel, contribute a skill to `.claude/skills/add-<name>/` that:
-
-1. Adds a `src/channels/<name>.ts` file implementing the `Channel` interface
-2. Calls `registerChannel(name, factory)` at module load
-3. Returns `null` from the factory if credentials are missing
-4. Adds an import line to `src/channels/index.ts`
-
-See existing skills (`/add-whatsapp`, `/add-telegram`, `/add-slack`, `/add-discord`, `/add-gmail`) for the pattern.
-
----
-
-## Folder Structure
-
-```
-nanoclaw/
-├── CLAUDE.md                      # Project context for Claude Code
-├── docs/
-│   ├── SPEC.md                    # This specification document
-│   ├── REQUIREMENTS.md            # Architecture decisions
-│   └── SECURITY.md                # Security model
-├── README.md                      # User documentation
-├── package.json                   # Node.js dependencies
-├── tsconfig.json                  # TypeScript configuration
-├── .mcp.json                      # MCP server configuration (reference)
-├── .gitignore
-│
-├── src/
-│   ├── index.ts                   # Orchestrator: state, message loop, agent invocation
-│   ├── channels/
-│   │   ├── registry.ts            # Channel factory registry
-│   │   └── index.ts               # Barrel imports for channel self-registration
-│   ├── ipc.ts                     # IPC watcher and task processing
-│   ├── router.ts                  # Message formatting and outbound routing
-│   ├── config.ts                  # Configuration constants
-│   ├── types.ts                   # TypeScript interfaces (includes Channel)
-│   ├── logger.ts                  # Pino logger setup
-│   ├── db.ts                      # SQLite database initialization and queries
-│   ├── group-queue.ts             # Per-group queue with global concurrency limit
-│   ├── mount-security.ts          # Mount allowlist validation for containers
-│   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
-│   ├── task-scheduler.ts          # Runs scheduled tasks when due
-│   └── container-runner.ts        # Spawns agents in containers
-│
-├── container/
-│   ├── Dockerfile                 # Container image (runs as 'node' user, includes Claude Code CLI)
-│   ├── build.sh                   # Build script for container image
-│   ├── agent-runner/              # Code that runs inside the container
-│   │   ├── package.json
-│   │   ├── tsconfig.json
-│   │   └── src/
-│   │       ├── index.ts           # Entry point (query loop, IPC polling, session resume)
-│   │       └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
-│   └── skills/
-│       └── agent-browser.md       # Browser automation skill
-│
-├── dist/                          # Compiled JavaScript (gitignored)
-│
-├── .claude/
-│   └── skills/
-│       ├── setup/SKILL.md              # /setup - First-time installation
-│       ├── customize/SKILL.md          # /customize - Add capabilities
-│       ├── debug/SKILL.md              # /debug - Container debugging
-│       ├── add-telegram/SKILL.md       # /add-telegram - Telegram channel
-│       ├── add-gmail/SKILL.md          # /add-gmail - Gmail integration
-│       ├── add-voice-transcription/    # /add-voice-transcription - Whisper
-│       ├── x-integration/SKILL.md      # /x-integration - X/Twitter
-│       ├── convert-to-apple-container/  # /convert-to-apple-container - Apple Container runtime
-│       └── add-parallel/SKILL.md       # /add-parallel - Parallel agents
-│
-├── groups/
-│   ├── CLAUDE.md                  # Global memory (all groups read this)
-│   ├── {channel}_main/             # Main control channel (e.g., whatsapp_main/)
-│   │   ├── CLAUDE.md              # Main channel memory
-│   │   └── logs/                  # Task execution logs
-│   └── {channel}_{group-name}/    # Per-group folders (created on registration)
-│       ├── CLAUDE.md              # Group-specific memory
-│       ├── logs/                  # Task logs for this group
-│       └── *.md                   # Files created by the agent
-│
-├── store/                         # Local data (gitignored)
-│   ├── auth/                      # WhatsApp authentication state
-│   └── messages.db                # SQLite database (messages, chats, scheduled_tasks, task_run_logs, registered_groups, sessions, router_state)
-│
-├── data/                          # Application state (gitignored)
-│   ├── sessions/                  # Per-group session data (.claude/ dirs with JSONL transcripts)
-│   ├── env/env                    # Copy of .env for container mounting
-│   └── ipc/                       # Container IPC (messages/, tasks/)
-│
-├── logs/                          # Runtime logs (gitignored)
-│   ├── nanoclaw.log               # Host stdout
-│   └── nanoclaw.error.log         # Host stderr
-│   # Note: Per-container logs are in groups/{folder}/logs/container-*.log
-│
-└── launchd/
-    └── com.nanoclaw.plist         # macOS service configuration
-```
-
----
-
-## Configuration
-
-Configuration constants are in `src/config.ts`:
-
-```typescript
-import path from 'path';
-
-export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
-export const POLL_INTERVAL = 2000;
-export const SCHEDULER_POLL_INTERVAL = 60000;
-
-// Paths are absolute (required for container mounts)
-const PROJECT_ROOT = process.cwd();
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
-export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
-export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
-
-// Container configuration
-export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10); // 30min default
-export const IPC_POLL_INTERVAL = 1000;
-export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min — keep container alive after last result
-export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
-
-export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
-```
-
-**Note:** Paths must be absolute for container volume mounts to work correctly.
-
-### Container Configuration
-
-Groups can have additional directories mounted via `containerConfig` in the SQLite `registered_groups` table (stored as JSON in the `container_config` column). Example registration:
-
-```typescript
-setRegisteredGroup("1234567890@g.us", {
-  name: "Dev Team",
-  folder: "whatsapp_dev-team",
-  trigger: "@Andy",
-  added_at: new Date().toISOString(),
-  containerConfig: {
-    additionalMounts: [
-      {
-        hostPath: "~/projects/webapp",
-        containerPath: "webapp",
-        readonly: false,
-      },
-    ],
-    timeout: 600000,
-  },
-});
-```
-
-Folder names follow the convention `{channel}_{group-name}` (e.g., `whatsapp_family-chat`, `telegram_dev-team`). The main group has `isMain: true` set during registration.
-
-Additional mounts appear at `/workspace/extra/{containerPath}` inside the container.
-
-**Mount syntax note:** Read-write mounts use `-v host:container`, but readonly mounts require `--mount "type=bind,source=...,target=...,readonly"` (the `:ro` suffix may not work on all runtimes).
-
-### Claude Authentication
-
-Configure authentication in a `.env` file in the project root. Two options:
-
-**Option 1: Claude Subscription (OAuth token)**
-```bash
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-```
-The token can be extracted from `~/.claude/.credentials.json` if you're logged in to Claude Code.
-
-**Option 2: Pay-per-use API Key**
-```bash
-ANTHROPIC_API_KEY=sk-ant-api03-...
-```
-
-Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
-
-### Changing the Assistant Name
-
-Set the `ASSISTANT_NAME` environment variable:
-
-```bash
-ASSISTANT_NAME=Bot npm start
-```
-
-Or edit the default in `src/config.ts`. This changes:
-- The trigger pattern (messages must start with `@YourName`)
-- The response prefix (`YourName:` added automatically)
-
-### Placeholder Values in launchd
-
-Files with `{{PLACEHOLDER}}` values need to be configured:
-- `{{PROJECT_ROOT}}` - Absolute path to your nanoclaw installation
-- `{{NODE_PATH}}` - Path to node binary (detected via `which node`)
-- `{{HOME}}` - User's home directory
-
----
-
-## Memory System
-
-NanoClaw uses a hierarchical memory system based on CLAUDE.md files.
-
-### Memory Hierarchy
-
-| Level | Location | Read By | Written By | Purpose |
-|-------|----------|---------|------------|---------|
-| **Global** | `groups/CLAUDE.md` | All groups | Main only | Preferences, facts, context shared across all conversations |
-| **Group** | `groups/{name}/CLAUDE.md` | That group | That group | Group-specific context, conversation memory |
-| **Files** | `groups/{name}/*.md` | That group | That group | Notes, research, documents created during conversation |
-
-### How Memory Works
-
-1. **Agent Context Loading**
-   - Agent runs with `cwd` set to `groups/{group-name}/`
-   - Claude Agent SDK with `settingSources: ['project']` automatically loads:
-     - `../CLAUDE.md` (parent directory = global memory)
-     - `./CLAUDE.md` (current directory = group memory)
-
-2. **Writing Memory**
-   - When user says "remember this", agent writes to `./CLAUDE.md`
-   - When user says "remember this globally" (main channel only), agent writes to `../CLAUDE.md`
-   - Agent can create files like `notes.md`, `research.md` in the group folder
-
-3. **Main Channel Privileges**
-   - Only the "main" group (self-chat) can write to global memory
-   - Main can manage registered groups and schedule tasks for any group
-   - Main can configure additional directory mounts for any group
-   - All groups have Bash access (safe because it runs inside container)
-
----
-
-## Session Management
-
-Sessions enable conversation continuity - Claude remembers what you talked about.
-
-### How Sessions Work
-
-1. Each group has a session ID stored in SQLite (`sessions` table, keyed by `group_folder`)
-2. Session ID is passed to Claude Agent SDK's `resume` option
-3. Claude continues the conversation with full context
-4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`
 
 ---
 
 ## Message Flow
 
-### Incoming Message Flow
+### 1. Inbound (Webhook → Queue)
 
 ```
-1. User sends a message via any connected channel
+Platform sends HTTP POST to /webhook/{channel}/[secret]
    │
-   ▼
-2. Channel receives message (e.g. Baileys for WhatsApp, Bot API for Telegram)
-   │
-   ▼
-3. Message stored in SQLite (store/messages.db)
-   │
-   ▼
-4. Message loop polls SQLite (every 2 seconds)
-   │
-   ▼
-5. Router checks:
-   ├── Is chat_jid in registered groups (SQLite)? → No: ignore
-   └── Does message match trigger pattern? → No: store but don't process
-   │
-   ▼
-6. Router catches up conversation:
-   ├── Fetch all messages since last agent interaction
-   ├── Format with timestamp and sender name
-   └── Build prompt with full conversation context
-   │
-   ▼
-7. Router invokes Claude Agent SDK:
-   ├── cwd: groups/{group-name}/
-   ├── prompt: conversation history + current message
-   ├── resume: session_id (for continuity)
-   └── mcpServers: nanoclaw (scheduler)
-   │
-   ▼
-8. Claude processes message:
-   ├── Reads CLAUDE.md files for context
-   └── Uses tools as needed (search, email, etc.)
-   │
-   ▼
-9. Router prefixes response with assistant name and sends via the owning channel
-   │
-   ▼
-10. Router updates last agent timestamp and saves session ID
+   ▼ verify signature (Ed25519 / HMAC-SHA256 / URL token)
+   │ reject if invalid → 401
+   ▼ parse payload → ParsedWebhookEvent
+   │ ignore unknown event types → 200
+   ▼ storeChatMetadata(DB, ...)
+   ▼ storeMessage(DB, message, assistantName)
+   ▼ getAllRegisteredGroups(DB) → check if chatJid is registered
+   │ if not registered → 200 (no processing)
+   ▼ MESSAGE_QUEUE.send({ type: 'inbound_message', chatJid, messages, timestamp })
+   ▼ return 200 immediately
 ```
 
-### Trigger Word Matching
-
-Messages must start with the trigger pattern (default: `@Andy`):
-- `@Andy what's the weather?` → ✅ Triggers Claude
-- `@andy help me` → ✅ Triggers (case insensitive)
-- `Hey @Andy` → ❌ Ignored (trigger not at start)
-- `What's up?` → ❌ Ignored (no trigger)
-
-### Conversation Catch-Up
-
-When a triggered message arrives, the agent receives all messages since its last interaction in that chat. Each message is formatted with timestamp and sender name:
+### 2. Processing (Queue Consumer)
 
 ```
-[Jan 31 2:32 PM] John: hey everyone, should we do pizza tonight?
-[Jan 31 2:33 PM] Sarah: sounds good to me
-[Jan 31 2:35 PM] John: @Andy what toppings do you recommend?
+Queue delivers message batch
+   │
+   ▼ for each message in batch:
+   │
+   ▼ getAllRegisteredGroups(DB) → find group config
+   │ if not found → ack (stale message)
+   ▼ getCursor(KV, chatJid) → lastTimestamp
+   ▼ getMessagesSince(DB, chatJid, lastTimestamp, assistantName)
+   │ if empty → ack
+   ▼ shouldProcess(messages, group, assistantName)
+   │ if false (no trigger) → ack
+   ▼ setCursor(KV, chatJid, newTimestamp)   ← advance before agent runs
+   ▼ getGroupClaudeMd(R2, group.folder)
+   ▼ getSessionId(KV, group.folder)
+   ▼ formatMessages(messages) → XML prompt
+   ▼ runAgent({ prompt, sessionId, groupFolder, chatJid, isMain, claudeMd }, env)
+   ▼ if agent.newSessionId → setSessionId(KV, ...) + setSession(DB, ...)
+   ▼ writeAgentLog(R2, ...)
+   ▼ if success: sendMessage(chatJid, result, env)
+   │ if error: setCursor(KV, chatJid, previousTimestamp)  ← rollback
+   ▼ ack (success) or retry (error, up to max_retries)
 ```
 
-This allows the agent to understand the conversation context even if it wasn't mentioned in every message.
+### 3. Trigger Detection
+
+For **non-main groups** with `requiresTrigger !== false`:
+```
+hasTrigger = messages.some(m =>
+  !m.is_bot_message &&
+  /^@{ASSISTANT_NAME}\b/i.test(m.content.trim())
+)
+```
+
+For **main groups** (`isMain: true`) and groups with `requiresTrigger: false`:
+- All messages are processed without trigger check.
+
+### 4. Message XML Format
+
+```xml
+<context timezone="UTC" />
+<messages>
+  <message sender="Alice" time="03/18/2026 10:00:00 AM">Hello!</message>
+  <message sender="Bob" time="03/18/2026 10:01:00 AM">@Andy what is 2+2?</message>
+</messages>
+```
+
+All user-provided content is XML-escaped (`escapeXml()` in `worker/src/router.ts`).
 
 ---
 
-## Commands
+## Agent Execution
 
-### Commands Available in Any Group
+See [specs/0008-agent-execution.md](specs/0008-agent-execution.md) for full specification.
 
-| Command | Example | Effect |
-|---------|---------|--------|
-| `@Assistant [message]` | `@Andy what's the weather?` | Talk to Claude |
+### Primary: Anthropic Messages API
 
-### Commands Available in Main Channel Only
+```
+POST https://api.anthropic.com/v1/messages
+Authorization: x-api-key {ANTHROPIC_API_KEY}
 
-| Command | Example | Effect |
-|---------|---------|--------|
-| `@Assistant add group "Name"` | `@Andy add group "Family Chat"` | Register a new group |
-| `@Assistant remove group "Name"` | `@Andy remove group "Work Team"` | Unregister a group |
-| `@Assistant list groups` | `@Andy list groups` | Show registered groups |
-| `@Assistant remember [fact]` | `@Andy remember I prefer dark mode` | Add to global memory |
+{
+  "model": "claude-opus-4-6",
+  "max_tokens": 4096,
+  "system": "<system prompt>",
+  "messages": [{ "role": "user", "content": "<XML prompt>" }]
+}
+```
+
+### Fallback: Workers AI
+
+Used when:
+1. `agentConfig.useWorkersAI === true` (explicit)
+2. Claude API call fails (automatic fallback)
+
+Default model: `@cf/meta/llama-3.1-8b-instruct` (configurable via `WORKER_AI_MODEL`).
+
+### System Prompt Structure
+
+```
+You are {assistantName}, a helpful AI assistant.
+You are responding in a group chat. Be concise and helpful.
+Current time: {ISO timestamp}
+
+[if isMain:]
+You have elevated admin privileges as the main control group assistant.
+You can manage groups, schedule tasks, and control the assistant system.
+
+[if claudeMd:]
+## Group Context (CLAUDE.md)
+{claudeMd}
+```
+
+---
+
+## Memory System
+
+### CLAUDE.md Hierarchy
+
+| Level | R2 Path | Writable By | Read By |
+|-------|---------|-------------|---------|
+| Global | `groups/global/CLAUDE.md` | Main group only | All groups |
+| Per-group | `groups/{folder}/CLAUDE.md` | That group's agent | That group |
+
+Memory is injected into the agent as part of the system prompt (Workers mode), not as a file the agent reads directly (that's the Node.js container mode where CLAUDE.md is mounted as a file).
+
+### Writing Memory
+
+In Workers mode, agents can request memory updates by including structured instructions in their response. The Worker MUST implement a memory-write API (future spec) to allow agents to update their group's CLAUDE.md in R2.
+
+Current status: CLAUDE.md is read on each request from R2. Write support is a future feature.
+
+---
+
+## Session Management
+
+Session IDs are stored in:
+- **KV** (`session:{groupFolder}`) — fast reads, 7-day TTL
+- **D1** (`sessions` table) — authoritative, no TTL
+
+The Anthropic Messages API is stateless. Session IDs are preserved for future use when the API adds conversation continuation support. Current behavior: each agent invocation is independent; conversation history is provided via the message context window.
 
 ---
 
 ## Scheduled Tasks
 
-NanoClaw has a built-in scheduler that runs tasks as full agents in their group's context.
-
-### How Scheduling Works
-
-1. **Group Context**: Tasks created in a group run with that group's working directory and memory
-2. **Full Agent Capabilities**: Scheduled tasks have access to all tools (WebSearch, file operations, etc.)
-3. **Optional Messaging**: Tasks can send messages to their group using the `send_message` tool, or complete silently
-4. **Main Channel Privileges**: The main channel can schedule tasks for any group and view all tasks
-
 ### Schedule Types
 
-| Type | Value Format | Example |
-|------|--------------|---------|
-| `cron` | Cron expression | `0 9 * * 1` (Mondays at 9am) |
-| `interval` | Milliseconds | `3600000` (every hour) |
-| `once` | ISO timestamp | `2024-12-25T09:00:00Z` |
+| Type | `schedule_value` | Behavior |
+|------|-----------------|----------|
+| `cron` | Cron expression (e.g. `0 9 * * 1`) | Runs on schedule, recurs |
+| `interval` | Milliseconds (e.g. `3600000`) | Runs every N ms |
+| `once` | ISO timestamp | Runs once, then `status = 'completed'` |
 
-### Creating a Task
+### Processing (Cron Trigger `* * * * *`)
 
-```
-User: @Andy remind me every Monday at 9am to review the weekly metrics
+1. Query D1: `SELECT * FROM scheduled_tasks WHERE status='active' AND next_run <= NOW()`
+2. For each due task: `MESSAGE_QUEUE.send({ type: 'scheduled_task', ... })`
+3. Update `next_run` (interval/cron) or set `status = 'completed'` (once)
 
-Claude: [calls mcp__nanoclaw__schedule_task]
-        {
-          "prompt": "Send a reminder to review weekly metrics. Be encouraging!",
-          "schedule_type": "cron",
-          "schedule_value": "0 9 * * 1"
-        }
+### Queue Consumer for Tasks
 
-Claude: Done! I'll remind you every Monday at 9am.
-```
-
-### One-Time Tasks
-
-```
-User: @Andy at 5pm today, send me a summary of today's emails
-
-Claude: [calls mcp__nanoclaw__schedule_task]
-        {
-          "prompt": "Search for today's emails, summarize the important ones, and send the summary to the group.",
-          "schedule_type": "once",
-          "schedule_value": "2024-01-31T17:00:00Z"
-        }
-```
-
-### Managing Tasks
-
-From any group:
-- `@Andy list my scheduled tasks` - View tasks for this group
-- `@Andy pause task [id]` - Pause a task
-- `@Andy resume task [id]` - Resume a paused task
-- `@Andy cancel task [id]` - Delete a task
-
-From main channel:
-- `@Andy list all tasks` - View tasks from all groups
-- `@Andy schedule task for "Family Chat": [prompt]` - Schedule for another group
+Runs the agent with `isScheduledTask: true` and sends the response to the group's channel.
 
 ---
 
-## MCP Servers
+## Group Management
 
-### NanoClaw MCP (built-in)
+Groups are registered via the Admin API (`POST /admin/groups`). Each group has:
 
-The `nanoclaw` MCP server is created dynamically per agent call with the current group's context.
+```typescript
+interface RegisteredGroup {
+  name: string;          // Display name
+  folder: string;        // R2/KV key prefix (e.g., "main", "family-chat")
+  trigger: string;       // Trigger text (e.g., "@Andy")
+  added_at: string;      // ISO timestamp
+  requiresTrigger?: boolean;  // Default: true
+  isMain?: boolean;           // One group per Worker deployment
+  agentConfig?: {
+    model?: string;
+    maxTokens?: number;
+    timeout?: number;
+    useWorkersAI?: boolean;
+  };
+}
+```
 
-**Available Tools:**
-| Tool | Purpose |
+**Main group** (`isMain: true`):
+- No trigger required (processes all messages)
+- Can schedule tasks for any group
+- Receives admin notifications
+
+---
+
+## Admin API
+
+All endpoints require `Authorization: Bearer {WEBHOOK_SECRET}`.
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| GET | `/admin/health` | — | DB status, version, timestamp |
+| GET | `/admin/groups` | — | All registered groups |
+| POST | `/admin/groups` | `{ jid, group }` | `{ ok: true }` |
+| GET | `/admin/tasks` | — | All scheduled tasks |
+| POST | `/admin/send` | `{ jid, text }` | `{ ok: true }` |
+
+---
+
+## Durable Objects
+
+### GroupSessionDO
+
+One instance per registered group, keyed by `groupFolder`.
+
+**State stored:**
+
+```typescript
+interface GroupSessionState {
+  sessionId?: string;           // Last known Claude session ID
+  lastAgentTimestamp?: string;  // Message cursor (ISO)
+  isProcessing: boolean;        // Processing lock
+  queuedMessages: NewMessage[]; // Pending messages
+  lastActivity: string;         // Last activity ISO timestamp
+}
+```
+
+**Endpoints:**
+
+| Path | Purpose |
 |------|---------|
-| `schedule_task` | Schedule a recurring or one-time task |
-| `list_tasks` | Show tasks (group's tasks, or all if main) |
-| `get_task` | Get task details and run history |
-| `update_task` | Modify task prompt or schedule |
-| `pause_task` | Pause a task |
-| `resume_task` | Resume a paused task |
-| `cancel_task` | Delete a task |
-| `send_message` | Send a message to the group via its channel |
+| `POST /enqueue` | Add messages to queue, set alarm if idle |
+| `GET /get-state` | Read current state |
+| `POST /set-session` | Update session ID |
+| `POST /set-cursor` | Update message cursor |
+| `POST /mark-processing` | Acquire processing lock (returns `{ok: false}` if locked) |
+| `POST /mark-done` | Release lock, optionally update session + cursor |
+| `GET /dequeue` | Get queued messages + session + cursor |
+
+**Alarm:** Triggered 100ms after message enqueue if not processing. Sends queued messages to `MESSAGE_QUEUE`.
+
+### RateLimiterDO
+
+Sliding window rate limiter keyed by `groupFolder`.
+
+**Endpoint:** `POST /check` with `{ key, limit, windowMs }` → `{ allowed, remaining, resetAt }`
+
+---
+
+## Security Model
+
+### Layered Security
+
+```
+Layer 1: Cloudflare network (DDoS protection, IP filtering)
+Layer 2: Webhook signature verification (per-channel cryptographic)
+Layer 3: Admin API Bearer token authentication
+Layer 4: Per-group Durable Object isolation (no cross-group access)
+Layer 5: Cloudflare Secrets (API keys never in code or logs)
+Layer 6: D1/R2/KV access scoped by JID and folder
+```
+
+### Threat Model
+
+| Threat | Mitigation |
+|--------|-----------|
+| Spoofed webhook | Cryptographic verification (Ed25519/HMAC-SHA256/URL token) |
+| Leaked API key | Cloudflare Secrets (never in files or git) |
+| Cross-group data access | DO isolation + D1 queries scoped by JID/folder |
+| Prompt injection via message content | XML escaping; agent has no tool access in Workers mode |
+| Unauthorized admin access | Bearer token on every admin request |
+| Replay attacks (Slack) | Timestamp check (reject requests >5 minutes old) |
+| Rate abuse / cost explosion | RateLimiterDO per group; `maxTokens` cap per group |
+
+### What Workers Mode Gives Up (vs Node.js mode)
+
+- **No shell access for agents** — Workers have no shell. This is a security improvement, not a regression.
+- **No filesystem access** — Agents can't read/write files. CLAUDE.md is injected as context.
+- **No browser automation** — No Chromium in Workers.
 
 ---
 
 ## Deployment
 
-NanoClaw runs as a single macOS launchd service.
+See [CLOUDFLARE_SETUP.md](CLOUDFLARE_SETUP.md) for the step-by-step guide.
 
-### Startup Sequence
-
-When NanoClaw starts, it:
-1. **Ensures container runtime is running** - Automatically starts it if needed; kills orphaned NanoClaw containers from previous runs
-2. Initializes the SQLite database (migrates from JSON files if they exist)
-3. Loads state from SQLite (registered groups, sessions, router state)
-4. **Connects channels** — loops through registered channels, instantiates those with credentials, calls `connect()` on each
-5. Once at least one channel is connected:
-   - Starts the scheduler loop
-   - Starts the IPC watcher for container messages
-   - Sets up the per-group queue with `processGroupMessages`
-   - Recovers any unprocessed messages from before shutdown
-   - Starts the message polling loop
-
-### Service: com.nanoclaw
-
-**launchd/com.nanoclaw.plist:**
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "...">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.nanoclaw</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{{NODE_PATH}}</string>
-        <string>{{PROJECT_ROOT}}/dist/index.js</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{{PROJECT_ROOT}}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{{HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
-        <key>HOME</key>
-        <string>{{HOME}}</string>
-        <key>ASSISTANT_NAME</key>
-        <string>Andy</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{{PROJECT_ROOT}}/logs/nanoclaw.log</string>
-    <key>StandardErrorPath</key>
-    <string>{{PROJECT_ROOT}}/logs/nanoclaw.error.log</string>
-</dict>
-</plist>
-```
-
-### Managing the Service
+### Quick Reference
 
 ```bash
-# Install service
-cp launchd/com.nanoclaw.plist ~/Library/LaunchAgents/
+# Create infrastructure
+wrangler d1 create thagomizer-claw-db
+wrangler r2 bucket create thagomizer-claw-storage
+wrangler kv namespace create STATE
+wrangler queues create thagomizer-messages
 
-# Start service
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
+# Update wrangler.toml with the IDs from above
 
-# Stop service
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
+# Apply DB schema
+cd worker && npm run db:migrate:remote
 
-# Check status
-launchctl list | grep nanoclaw
+# Set secrets
+wrangler secret put ANTHROPIC_API_KEY
+wrangler secret put WEBHOOK_SECRET
 
-# View logs
-tail -f logs/nanoclaw.log
+# Deploy
+cd worker && npm run deploy
 ```
 
 ---
 
-## Security Considerations
+## Node.js Reference Mode
 
-### Container Isolation
+The original NanoClaw architecture is preserved in `src/`. It is frozen — new features go into Workers mode only.
 
-All agents run inside containers (lightweight Linux VMs), providing:
-- **Filesystem isolation**: Agents can only access mounted directories
-- **Safe Bash access**: Commands run inside the container, not on your Mac
-- **Network isolation**: Can be configured per-container if needed
-- **Process isolation**: Container processes can't affect the host
-- **Non-root user**: Container runs as unprivileged `node` user (uid 1000)
+Key differences:
+- Docker containers run the Claude Agent SDK with full tool access
+- `better-sqlite3` (sync) instead of D1 (async)
+- Filesystem `groups/`, `data/` instead of R2/KV
+- `.env` file (gitignored) for secrets
+- Container image: `thagomizer-agent:latest`
+- Output markers: `THAGOMIZER_OUTPUT_START/END`
 
-### Prompt Injection Risk
-
-WhatsApp messages could contain malicious instructions attempting to manipulate Claude's behavior.
-
-**Mitigations:**
-- Container isolation limits blast radius
-- Only registered groups are processed
-- Trigger word required (reduces accidental processing)
-- Agents can only access their group's mounted directories
-- Main can configure additional directories per group
-- Claude's built-in safety training
-
-**Recommendations:**
-- Only register trusted groups
-- Review additional directory mounts carefully
-- Review scheduled tasks periodically
-- Monitor logs for unusual activity
-
-### Credential Storage
-
-| Credential | Storage Location | Notes |
-|------------|------------------|-------|
-| Claude CLI Auth | data/sessions/{group}/.claude/ | Per-group isolation, mounted to /home/node/.claude/ |
-| WhatsApp Session | store/auth/ | Auto-created, persists ~20 days |
-
-### File Permissions
-
-The groups/ folder contains personal memory and should be protected:
-```bash
-chmod 700 groups/
-```
+For setup: `npm run dev` or `./container/build.sh` + `/setup` in Claude Code.
 
 ---
 
-## Troubleshooting
-
-### Common Issues
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| No response to messages | Service not running | Check `launchctl list | grep nanoclaw` |
-| "Claude Code process exited with code 1" | Container runtime failed to start | Check logs; NanoClaw auto-starts container runtime but may fail |
-| "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/root/.claude/` |
-| Session not continuing | Session ID not saved | Check SQLite: `sqlite3 store/messages.db "SELECT * FROM sessions"` |
-| Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
-| "QR code expired" | WhatsApp session expired | Delete store/auth/ and restart |
-| "No groups registered" | Haven't added groups | Use `@Andy add group "Name"` in main |
-
-### Log Location
-
-- `logs/nanoclaw.log` - stdout
-- `logs/nanoclaw.error.log` - stderr
-
-### Debug Mode
-
-Run manually for verbose output:
-```bash
-npm run dev
-# or
-node dist/index.js
-```
+*ThagomizerClaw Specification v1.0*
+*Eduardo Arana & Soda 🥤*

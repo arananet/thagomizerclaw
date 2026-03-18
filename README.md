@@ -1,231 +1,358 @@
+# ThagomizerClaw 🦕
+
 <p align="center">
-  <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
+  <strong>Enterprise Claude assistant on Cloudflare Workers.</strong><br>
+  Globally distributed. Zero infrastructure. Secrets never touch your machine.
 </p>
 
 <p align="center">
-  An AI assistant that runs agents securely in their own containers. Lightweight, built to be easily understood and completely customized for your needs.
+  Built by <strong>Eduardo Arana</strong> &amp; <strong>Soda 🥤</strong><br>
+  Forked from <a href="https://github.com/qwibitai/nanoclaw">NanoClaw</a> by qwibitai
 </p>
 
 <p align="center">
-  <a href="https://nanoclaw.dev">nanoclaw.dev</a>&nbsp; • &nbsp;
-  <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
-  <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
-  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
+  <a href="CONSTITUTION.md">Constitution</a> &nbsp;•&nbsp;
+  <a href="docs/SPEC.md">Spec</a> &nbsp;•&nbsp;
+  <a href="docs/SDD.md">SDD Guide</a> &nbsp;•&nbsp;
+  <a href="docs/CLOUDFLARE_SETUP.md">Deploy</a> &nbsp;•&nbsp;
+  <a href="docs/CLOUDFLARE_IMPLEMENTATION.md">Implementation Guide</a>
 </p>
 
 ---
 
-<h2 align="center">🐳 Now Runs in Docker Sandboxes</h2>
-<p align="center">Every agent gets its own isolated container inside a micro VM.<br>Hypervisor-level isolation. Millisecond startup. No complex setup.</p>
+## What Is ThagomizerClaw?
 
-**macOS (Apple Silicon)**
-```bash
-curl -fsSL https://nanoclaw.dev/install-docker-sandboxes.sh | bash
-```
+ThagomizerClaw is a Claude-powered assistant that runs on Cloudflare Workers — no server, no Docker, no `.env` files on disk. It responds to messages from Telegram, Discord, and Slack, processes them with Claude (or Workers AI as a fallback), and sends replies back. Everything is serverless, globally distributed, and secured by Cloudflare's infrastructure.
 
-**Windows (WSL)**
-```bash
-curl -fsSL https://nanoclaw.dev/install-docker-sandboxes-windows.sh | bash
-```
+It is a fork of [NanoClaw](https://github.com/qwibitai/nanoclaw), retaining the same core philosophy — **small enough to understand, secure by architecture** — and extending it with enterprise-grade Cloudflare Workers primitives.
 
-> Currently supported on macOS (Apple Silicon) and Windows (x86). Linux support coming soon.
-
-<p align="center"><a href="https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes">Read the announcement →</a>&nbsp; · &nbsp;<a href="docs/docker-sandboxes.md">Manual setup guide →</a></p>
+> **The name:** A thagomizer was the spiked tail of a stegosaurus — a precisely structured defensive system. It wasn't decorative. It worked.
 
 ---
 
-## Why I Built NanoClaw
+## Architecture at a Glance
 
-[OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
-
-NanoClaw provides that same core functionality, but in a codebase small enough to understand: one process and a handful of files. Claude agents run in their own Linux containers with filesystem isolation, not merely behind permission checks.
-
-## Quick Start
-
-```bash
-gh repo fork qwibitai/nanoclaw --clone
-cd nanoclaw
-claude
+```
+Telegram / Discord / Slack
+        │  (HTTP webhook, cryptographically verified)
+        ▼
+Cloudflare Worker (worker/src/index.ts)
+        │
+   ┌────▼──────────┐
+   │  D1 Database  │ ← store message (SQLite, globally replicated)
+   └────┬──────────┘
+        │
+        ▼ (async — response to platform < 3s)
+Cloudflare Queue
+        │
+        ▼
+runAgent() → Anthropic Claude API (primary) / Workers AI (fallback)
+        │
+Channel API (Telegram / Discord / Slack) ← send reply
 ```
 
-<details>
-<summary>Without GitHub CLI</summary>
+**Cloudflare primitives used:**
 
-1. Fork [qwibitai/nanoclaw](https://github.com/qwibitai/nanoclaw) on GitHub (click the Fork button)
-2. `git clone https://github.com/<your-username>/nanoclaw.git`
-3. `cd nanoclaw`
-4. `claude`
+| What | Primitive |
+|------|-----------|
+| Messages, groups, tasks | D1 (SQLite) |
+| CLAUDE.md files, logs | R2 (object storage) |
+| Cursors, sessions | KV (sub-ms reads) |
+| Async agent execution | Queues |
+| Per-group state + lock | Durable Objects |
+| LLM fallback | Workers AI (Llama/Mistral) |
+| Secrets | Cloudflare Secrets (never in code) |
+| Scheduled tasks | Cron Triggers |
 
-</details>
+---
 
-Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup and service configuration.
+## Quick Start (Cloudflare Workers)
 
-> **Note:** Commands prefixed with `/` (like `/setup`, `/add-whatsapp`) are [Claude Code skills](https://code.claude.com/docs/en/skills). Type them inside the `claude` CLI prompt, not in your regular terminal. If you don't have Claude Code installed, get it at [claude.com/product/claude-code](https://claude.com/product/claude-code).
+**Prerequisites:** Node.js 20+, a Cloudflare account (free tier works), an Anthropic API key.
 
-## Philosophy
+```bash
+# 1. Fork and clone this repo
+gh repo fork arananet/thagomizer_claw --clone
+cd thagomizer_claw
 
-**Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.
+# 2. Install Wrangler
+npm install -g wrangler
+wrangler login
 
-**Secure by isolation.** Agents run in Linux containers (Apple Container on macOS, or Docker) and they can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
+# 3. Create Cloudflare resources
+wrangler d1 create thagomizer-claw-db         # copy database_id
+wrangler kv namespace create STATE             # copy id
+wrangler r2 bucket create thagomizer-claw-storage
+wrangler queues create thagomizer-messages
+wrangler queues create thagomizer-messages-dlq
 
-**Built for the individual user.** NanoClaw isn't a monolithic framework; it's software that fits each user's exact needs. Instead of becoming bloatware, NanoClaw is designed to be bespoke. You make your own fork and have Claude Code modify it to match your needs.
+# 4. Paste the IDs from step 3 into wrangler.toml
 
-**Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that it's safe to make changes.
+# 5. Apply database schema
+cd worker && npm install && npm run db:migrate:remote
 
-**AI-native.**
-- No installation wizard; Claude Code guides setup.
-- No monitoring dashboard; ask Claude what's happening.
-- No debugging tools; describe the problem and Claude fixes it.
+# 6. Set secrets (never in files — always via wrangler)
+wrangler secret put ANTHROPIC_API_KEY
+wrangler secret put WEBHOOK_SECRET
+wrangler secret put TELEGRAM_BOT_TOKEN   # if using Telegram
 
-**Skills over features.** Instead of adding features (e.g. support for Telegram) to the codebase, contributors submit [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
+# 7. Deploy
+npm run deploy
 
-**Best harness, best model.** NanoClaw runs on the Claude Agent SDK, which means you're running Claude Code directly. Claude Code is highly capable and its coding and problem-solving capabilities allow it to modify and expand NanoClaw and tailor it to each user.
+# 8. Register your Telegram webhook
+curl -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  -d "url=https://thagomizer-claw.YOUR_SUBDOMAIN.workers.dev/webhook/telegram/${WEBHOOK_SECRET}"
+
+# 9. Register your first group
+curl -X POST "https://thagomizer-claw.YOUR_SUBDOMAIN.workers.dev/admin/groups" \
+  -H "Authorization: Bearer ${WEBHOOK_SECRET}" \
+  -H "Content-Type: application/json" \
+  -d '{"jid":"tg:-1001234567890","group":{"name":"Main","folder":"main","trigger":"@Andy","added_at":"2026-03-18T00:00:00Z","isMain":true,"requiresTrigger":false}}'
+```
+
+For the full guide, see [docs/CLOUDFLARE_SETUP.md](docs/CLOUDFLARE_SETUP.md).
+
+---
 
 ## What It Supports
 
-- **Multi-channel messaging** - Talk to your assistant from WhatsApp, Telegram, Discord, Slack, or Gmail. Add channels with skills like `/add-whatsapp` or `/add-telegram`. Run one or many at the same time.
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted to it.
-- **Main channel** - Your private channel (self-chat) for admin control; every group is completely isolated
-- **Scheduled tasks** - Recurring jobs that run Claude and can message you back
-- **Web access** - Search and fetch content from the Web
-- **Container isolation** - Agents are sandboxed in [Docker Sandboxes](https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes) (micro VM isolation), Apple Container (macOS), or Docker (macOS/Linux)
-- **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
-- **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
+- **Multi-channel messaging** — Telegram, Discord, Slack. More via skills.
+- **Per-group isolation** — Each group has its own CLAUDE.md memory, session, and cursor. Groups cannot see each other.
+- **Main channel** — One admin group with elevated privileges (no trigger required, can manage all groups and tasks)
+- **Scheduled tasks** — Recurring jobs that run Claude and can message you back (cron, interval, once)
+- **Workers AI fallback** — If Claude API is unavailable, falls back to Llama/Mistral on-device
+- **Enterprise secrets** — All credentials via Cloudflare Secrets Store. Nothing on disk.
+- **Global distribution** — Runs at Cloudflare's edge (300+ locations)
 
-## Usage
+---
 
-Talk to your assistant with the trigger word (default: `@Andy`):
+## Talking to the Assistant
+
+Use the trigger word (default: `@Andy`) followed by your message:
 
 ```
-@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
-@Andy review the git history for the past week each Friday and update the README if there's drift
-@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
+@Andy what's on my task list for today?
+@Andy schedule a Monday 9am briefing about this week's goals
+@Andy summarize the conversation from the last hour
 ```
 
-From the main channel (your self-chat), you can manage groups and tasks:
+From the main group (admin channel), you can manage other groups:
 ```
-@Andy list all scheduled tasks across groups
+@Andy register group "Family Chat" as tg:-1001111111111
+@Andy list all scheduled tasks
 @Andy pause the Monday briefing task
-@Andy join the Family Chat group
 ```
 
-## Customizing
+---
 
-NanoClaw doesn't use configuration files. To make changes, just tell Claude Code what you want:
+## Self-Hosted Mode (Node.js)
 
-- "Change the trigger word to @Bob"
-- "Remember in the future to make responses shorter and more direct"
-- "Add a custom greeting when I say good morning"
-- "Store conversation summaries weekly"
+The original NanoClaw Node.js architecture is preserved in `src/` for users who need:
+- Agent tool access (Bash, file system, browser)
+- WhatsApp (Baileys-based)
+- Long-running stateful containers
 
-Or run `/customize` for guided changes.
+See [docs/SPEC.md — Node.js Reference Mode](docs/SPEC.md#nodejs-reference-mode) and the original NanoClaw README sections below.
 
-The codebase is small enough that Claude can safely modify it.
-
-## Contributing
-
-**Don't add features. Add skills.**
-
-If you want to add Telegram support, don't create a PR that adds Telegram to the core codebase. Instead, fork NanoClaw, make the code changes on a branch, and open a PR. We'll create a `skill/telegram` branch from your PR that other users can merge into their fork.
-
-Users then run `/add-telegram` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
-
-### RFS (Request for Skills)
-
-Skills we'd like to see:
-
-**Communication Channels**
-- `/add-signal` - Add Signal as a channel
-
-**Session Management**
-- `/clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
-
-## Requirements
-
-- macOS or Linux
-- Node.js 20+
-- [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
-
-## Architecture
-
-```
-Channels --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+```bash
+npm run dev          # Hot-reload development
+./container/build.sh # Build thagomizer-agent:latest Docker image
 ```
 
-Single Node.js process. Channels are added via skills and self-register at startup — the orchestrator connects whichever ones have credentials present. Agents execute in isolated Linux containers with filesystem isolation. Only mounted directories are accessible. Per-group message queue with concurrency control. IPC via filesystem.
+---
 
-For the full architecture details, see [docs/SPEC.md](docs/SPEC.md).
+## Philosophy
 
-Key files:
-- `src/index.ts` - Orchestrator: state, message loop, agent invocation
-- `src/channels/registry.ts` - Channel registry (self-registration at startup)
-- `src/ipc.ts` - IPC watcher and task processing
-- `src/router.ts` - Message formatting and outbound routing
-- `src/group-queue.ts` - Per-group queue with global concurrency limit
-- `src/container-runner.ts` - Spawns streaming agent containers
-- `src/task-scheduler.ts` - Runs scheduled tasks
-- `src/db.ts` - SQLite operations (messages, groups, sessions, state)
-- `groups/*/CLAUDE.md` - Per-group memory
+**Spec first, code second.** Every feature begins with a specification. No code without a contract. See [docs/SDD.md](docs/SDD.md).
+
+**Security through architecture, not policy.** Secrets in vaults, not files. Verification cryptographic, not optional. Isolation structural, not behavioral.
+
+**Small enough to understand.** The Workers implementation (`worker/`) can be read start-to-finish in under two hours. If it can't, something has gone wrong.
+
+**Cloudflare native.** D1, R2, KV, Queues, Durable Objects, Workers AI — used as designed, not bolted on top of Node.js patterns.
+
+**Skills over features.** New channels and integrations are Claude Code skills, not core commits. The core stays minimal.
+
+The full governing principles are in [CONSTITUTION.md](CONSTITUTION.md).
+
+---
+
+## Development
+
+### Cloudflare Workers
+
+```bash
+# Local dev (reads .dev.vars for secrets)
+cp .dev.vars.example .dev.vars  # fill in real values
+cd worker && npm install && npm run dev
+
+# Type checking
+cd worker && npx tsc --noEmit
+
+# Deploy
+cd worker && npm run deploy
+
+# Tail logs
+cd worker && npm run tail
+
+# Manage secrets
+wrangler secret put ANTHROPIC_API_KEY
+wrangler secret list
+```
+
+### Node.js Reference
+
+```bash
+npm run dev          # tsx watch
+npm run build        # tsc
+npm test             # vitest
+./container/build.sh # Docker image
+```
+
+---
+
+## Spec-Driven Development
+
+ThagomizerClaw uses spec-driven development (SDD). Before writing code, write the spec.
+
+```
+docs/
+├── CONSTITUTION.md          # Governing principles (read this first)
+├── SDD.md                   # SDD process guide
+├── SPEC.md                  # Full system specification
+├── REQUIREMENTS.md          # Requirements and architecture decisions
+├── CLOUDFLARE_SETUP.md      # Deployment guide
+├── CLOUDFLARE_IMPLEMENTATION.md  # Implementation guide (debugging, extending)
+├── CLOUDFLARE_SECRETS.md    # Secrets management
+└── specs/
+    ├── 0001-workers-architecture.md
+    ├── 0008-agent-execution.md
+    ├── 0009-cloudflare-secrets.md
+    └── ...
+```
+
+To contribute:
+1. Write a spec in `docs/specs/XXXX-{feature}.md`
+2. Get it reviewed via pull request
+3. Implement to spec
+4. Write tests against spec test cases
+5. Update spec status to `Implemented`
+
+---
 
 ## FAQ
 
-**Why Docker?**
+**Why Cloudflare Workers instead of AWS Lambda / Fly.io / a VPS?**
 
-Docker provides cross-platform support (macOS, Linux and even Windows via WSL2) and a mature ecosystem. On macOS, you can optionally switch to Apple Container via `/convert-to-apple-container` for a lighter-weight native runtime.
+Cloudflare's primitive set maps almost exactly to what ThagomizerClaw needs (D1, R2, KV, Queues, Durable Objects, Workers AI, Secrets). Zero infrastructure management. Global distribution. Sub-millisecond cold starts. Secrets that never touch the filesystem.
 
-**Can I run this on Linux?**
+**Why no Docker containers in Workers mode?**
 
-Yes. Docker is the default runtime and works on both macOS and Linux. Just run `/setup`.
+Cloudflare Workers are V8 isolates — no filesystem, no shell. Docker requires both. The trade-off is intentional: Workers mode agents don't get tool access (Bash, file ops), but they also can't do damage. For tool access, use the Node.js reference mode.
+
+**Why no WhatsApp in Workers mode?**
+
+WhatsApp (via Baileys) requires a persistent WebSocket connection and filesystem for session storage. Workers are stateless HTTP handlers. WhatsApp Business API (webhook-based) could be added as a skill — contributions welcome.
+
+**Can I use a different model?**
+
+Yes. Set `agentConfig.model` when registering a group via the Admin API. Any Anthropic model ID works. For non-Anthropic models, set `agentConfig.useWorkersAI: true` and configure `WORKER_AI_MODEL` in `wrangler.toml`.
 
 **Is this secure?**
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
-
-**Why no configuration files?**
-
-We don't want configuration sprawl. Every user should customize NanoClaw so that the code does exactly what they want, rather than configuring a generic system. If you prefer having config files, you can tell Claude to add them.
-
-**Can I use third-party or open-source models?**
-
-Yes. NanoClaw supports any Claude API-compatible model endpoint. Set these environment variables in your `.env` file:
-
-```bash
-ANTHROPIC_BASE_URL=https://your-api-endpoint.com
-ANTHROPIC_AUTH_TOKEN=your-token-here
-```
-
-This allows you to use:
-- Local models via [Ollama](https://ollama.ai) with an API proxy
-- Open-source models hosted on [Together AI](https://together.ai), [Fireworks](https://fireworks.ai), etc.
-- Custom model deployments with Anthropic-compatible APIs
-
-Note: The model must support the Anthropic API format for best compatibility.
+Secrets are in Cloudflare Secrets Store — encrypted at rest, never in code or git. Webhooks are verified cryptographically (Ed25519, HMAC-SHA256). Groups are isolated via Durable Objects. Workers run in V8 isolates (no filesystem access). See [docs/SPEC.md — Security Model](docs/SPEC.md#security-model) for the full threat model.
 
 **How do I debug issues?**
 
-Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?" "Why did this message not get a response?" That's the AI-native approach that underlies NanoClaw.
+```bash
+cd worker && npm run tail    # live log stream
+curl .../admin/health        # health check
+wrangler d1 execute thagomizer-claw-db --command "SELECT * FROM messages LIMIT 5"
+```
 
-**Why isn't the setup working for me?**
+See [docs/CLOUDFLARE_IMPLEMENTATION.md](docs/CLOUDFLARE_IMPLEMENTATION.md) for full debugging guide.
 
-If you have issues, during setup, Claude will try to dynamically fix them. If that doesn't work, run `claude`, then run `/debug`. If Claude finds an issue that is likely affecting other users, open a PR to modify the setup SKILL.md.
+**What's the difference between this and NanoClaw?**
 
-**What changes will be accepted into the codebase?**
+ThagomizerClaw is NanoClaw with Cloudflare Workers as the deployment target. Same domain model (groups, sessions, triggers, CLAUDE.md), different infrastructure. NanoClaw runs on your Mac in Docker. ThagomizerClaw runs on Cloudflare's global edge.
 
-Only security fixes, bug fixes, and clear improvements will be accepted to the base configuration. That's all.
+---
 
-Everything else (new capabilities, OS compatibility, hardware support, enhancements) should be contributed as skills.
+## Channels
 
-This keeps the base system minimal and lets every user customize their installation without inheriting features they don't want.
+| Channel | Status | Notes |
+|---------|--------|-------|
+| Telegram | ✅ Workers | URL token verification |
+| Discord | ✅ Workers | Ed25519 signature |
+| Slack | ✅ Workers | HMAC-SHA256 + replay protection |
+| WhatsApp | ✅ Node.js | Baileys (self-hosted only) |
+| Gmail | Via skill | `/add-gmail` skill (Node.js) |
 
-## Community
+---
 
-Questions? Ideas? [Join the Discord](https://discord.gg/VDdww8qS42).
+## Contributing
 
-## Changelog
+Follow the [SDD guide](docs/SDD.md): spec before code, always.
 
-See [CHANGELOG.md](CHANGELOG.md) for breaking changes and migration notes.
+**For new channels:** write a spec in `docs/specs/01XX-{channel}.md`, implement it, write tests against the spec test cases.
+
+**For security changes:** spec required in `docs/specs/02XX-*.md`. Security analysis MUST be honest — describe what the threat is and why the mitigation works.
+
+**The core does not grow.** New capabilities ship as Claude Code skills (`.claude/skills/`). If you're adding a feature that every user must carry, reconsider. If you're adding a skill that users can opt into, welcome.
+
+---
+
+## Project Structure
+
+```
+thagomizer_claw/
+├── CONSTITUTION.md            # Governing principles — READ FIRST
+├── CLAUDE.md                  # AI assistant context
+├── README.md                  # This file
+├── wrangler.toml              # Cloudflare Workers configuration
+├── .dev.vars.example          # Local dev secrets template
+│
+├── worker/                    # Cloudflare Workers (PRIMARY)
+│   ├── src/
+│   │   ├── index.ts           # Worker entry (fetch, queue, scheduled)
+│   │   ├── types.ts           # Env bindings + domain types
+│   │   ├── db.ts              # D1 adapter
+│   │   ├── storage.ts         # R2 + KV adapter
+│   │   ├── agent.ts           # Claude API + Workers AI
+│   │   ├── router.ts          # Message formatting
+│   │   ├── channels/
+│   │   │   ├── telegram.ts
+│   │   │   ├── discord.ts
+│   │   │   └── slack.ts
+│   │   └── durable-objects/
+│   │       └── GroupSession.ts
+│   └── package.json
+│
+├── src/                       # Node.js reference (PRESERVED, FROZEN)
+├── container/                 # Docker agent image (Node.js mode)
+├── migrations/                # D1 schema
+│   └── 0001_initial.sql
+│
+└── docs/
+    ├── SPEC.md                # System specification
+    ├── REQUIREMENTS.md        # Requirements + architecture decisions
+    ├── SDD.md                 # Spec-driven development guide
+    ├── CLOUDFLARE_SETUP.md    # Step-by-step deployment
+    ├── CLOUDFLARE_IMPLEMENTATION.md  # Developer guide
+    ├── CLOUDFLARE_SECRETS.md  # Secrets management
+    └── specs/                 # Individual feature specs
+        ├── 0001-workers-architecture.md
+        ├── 0008-agent-execution.md
+        └── 0009-cloudflare-secrets.md
+```
+
+---
 
 ## License
 
 MIT
+
+---
+
+*ThagomizerClaw — Eduardo Arana & Soda 🥤*
+*Forked from [NanoClaw](https://github.com/qwibitai/nanoclaw) by qwibitai (MIT)*

@@ -1,196 +1,169 @@
-# NanoClaw Requirements
+# ThagomizerClaw Requirements
 
-Original requirements and design decisions from the project creator.
+*Forked from NanoClaw by Eduardo Arana & Soda 🥤*
 
----
-
-## Why This Exists
-
-This is a lightweight, secure alternative to OpenClaw (formerly ClawBot). That project became a monstrosity - 4-5 different processes running different gateways, endless configuration files, endless integrations. It's a security nightmare where agents don't run in isolated processes; there's all kinds of leaky workarounds trying to prevent them from accessing parts of the system they shouldn't. It's impossible for anyone to realistically understand the whole codebase. When you run it you're kind of just yoloing it.
-
-NanoClaw gives you the core functionality without that mess.
+This document captures the foundational requirements and design decisions. For the specification process, see [SDD.md](SDD.md). For governing principles, see [CONSTITUTION.md](../CONSTITUTION.md).
 
 ---
 
-## Philosophy
+## Why This Fork Exists
 
-### Small Enough to Understand
+NanoClaw provides an excellent minimal architecture for a personal Claude assistant. ThagomizerClaw takes that architecture and makes it enterprise-grade by migrating it to Cloudflare Workers.
 
-The entire codebase should be something you can read and understand. One Node.js process. A handful of source files. No microservices, no message queues, no abstraction layers.
+The specific problems this fork solves:
 
-### Security Through True Isolation
-
-Instead of application-level permission systems trying to prevent agents from accessing things, agents run in actual Linux containers. The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your Mac.
-
-### Built for One User
-
-This isn't a framework or a platform. It's working software for my specific needs. I use WhatsApp and Email, so it supports WhatsApp and Email. I don't use Telegram, so it doesn't support Telegram. I add the integrations I actually want, not every possible integration.
-
-### Customization = Code Changes
-
-No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change the code to do what you want.
-
-### AI-Native Development
-
-I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
-
-The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
-
-### Skills Over Features
-
-When people contribute, they shouldn't add "Telegram support alongside WhatsApp." They should contribute a skill like `/add-telegram` that transforms the codebase. Users fork the repo, run skills to customize, and end up with clean code that does exactly what they need - not a bloated system trying to support everyone's use case simultaneously.
+1. **Infrastructure burden** — NanoClaw requires an always-on Mac or VPS. ThagomizerClaw requires no servers. `wrangler deploy` is the full deployment.
+2. **Secret exposure** — NanoClaw reads secrets from `.env` files on disk. ThagomizerClaw reads secrets from Cloudflare Secrets Store, which is encrypted at rest and never accessible from the filesystem.
+3. **Single-region** — NanoClaw runs in one location. ThagomizerClaw runs at Cloudflare's edge (300+ locations), globally.
+4. **Container startup latency** — NanoClaw spawns a Docker container per agent invocation (2–5s overhead). ThagomizerClaw calls the Anthropic API directly from the Worker (~0ms overhead for startup).
+5. **Polling loops** — NanoClaw has a 2s polling loop for messages. ThagomizerClaw is fully event-driven via webhooks and Queues.
 
 ---
 
-## RFS (Request for Skills)
+## Core Requirements
 
-Skills we'd love contributors to build:
+### R1 — Serverless First
+The system MUST run entirely within Cloudflare's infrastructure. No VPS, no always-on server, no container runtime required from the user.
 
-### Communication Channels
-Skills to add or switch to different messaging platforms:
-- `/add-telegram` - Add Telegram as an input channel
-- `/add-slack` - Add Slack as an input channel
-- `/add-discord` - Add Discord as an input channel
-- `/add-sms` - Add SMS via Twilio or similar
-- `/convert-to-telegram` - Replace WhatsApp with Telegram entirely
+### R2 — Zero-Secret-in-Code
+No secret value MUST ever appear in source code, configuration files committed to git, or Cloudflare environment variables (only Cloudflare Secrets).
 
-### Container Runtime
-The project uses Docker by default (cross-platform). For macOS users who prefer Apple Container:
-- `/convert-to-apple-container` - Switch from Docker to Apple Container (macOS-only)
+### R3 — Cryptographic Webhook Verification
+Every channel webhook MUST be verified using the platform's standard mechanism before any processing occurs:
+- Telegram: URL path secret token
+- Discord: Ed25519 signature
+- Slack: HMAC-SHA256 + timestamp
 
-### Platform Support
-- `/setup-linux` - Make the full setup work on Linux (depends on Docker conversion)
-- `/setup-windows` - Windows support via WSL2 + Docker
+### R4 — Per-Group Isolation
+Groups MUST be isolated from each other. One group's messages, session, cursor, and CLAUDE.md MUST NOT be accessible to another group's agent execution.
 
----
+Implemented via:
+- Durable Objects keyed by `groupFolder`
+- D1 queries scoped by `chat_jid` or `group_folder`
+- R2 paths scoped by `groups/{folder}/`
+- KV keys scoped by `session:{folder}` and `cursor:{jid}`
 
-## Vision
+### R5 — Async Agent Execution
+Agent execution MUST be decoupled from webhook response. Webhooks MUST respond within 3 seconds (platform requirement). Agent execution MAY take up to `AGENT_TIMEOUT_MS` (default 120s).
 
-A personal Claude assistant accessible via WhatsApp, with minimal custom code.
+Implemented via Cloudflare Queues: webhook handler enqueues, queue consumer executes.
 
-**Core components:**
-- **Claude Agent SDK** as the core agent
-- **Containers** for isolated agent execution (Linux VMs)
-- **WhatsApp** as the primary I/O channel
-- **Persistent memory** per conversation and globally
-- **Scheduled tasks** that run Claude and can message back
-- **Web access** for search and browsing
-- **Browser automation** via agent-browser
+### R6 — Graceful Degradation
+If the Claude API is unavailable, the system SHOULD fall back to Workers AI (Llama/Mistral). If Workers AI is also unavailable, the system MUST return an error to the user rather than silently dropping the message.
 
-**Implementation approach:**
-- Use existing tools (WhatsApp connector, Claude Agent SDK, MCP servers)
-- Minimal glue code
-- File-based systems where possible (CLAUDE.md for memory, folders for groups)
+### R7 — Cursor-Based Message Deduplication
+The system MUST track the last-processed message timestamp per group (`cursor:{chatJid}` in KV). On agent error, the cursor MUST be rolled back so the message is reprocessed on the next attempt. On success, the cursor MUST advance.
+
+### R8 — Spec-Driven Development
+Every non-trivial change MUST be preceded by a specification document in `docs/specs/`. See [SDD.md](SDD.md).
 
 ---
 
 ## Architecture Decisions
 
-### Message Routing
-- A router listens to WhatsApp and routes messages based on configuration
-- Only messages from registered groups are processed
-- Trigger: `@Andy` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
-- Unregistered groups are ignored completely
+### Decision: Cloudflare Workers over VPS/Lambda
 
-### Memory System
-- **Per-group memory**: Each group has a folder with its own `CLAUDE.md`
-- **Global memory**: Root `CLAUDE.md` is read by all groups, but only writable from "main" (self-chat)
-- **Files**: Groups can create/read files in their folder and reference them
-- Agent runs in the group's folder, automatically inherits both CLAUDE.md files
+**Alternatives considered:**
+- AWS Lambda + DynamoDB + S3
+- Fly.io persistent VMs
+- Railway/Render always-on Node.js
 
-### Session Management
-- Each group maintains a conversation session (via Claude Agent SDK)
-- Sessions auto-compact when context gets too long, preserving critical information
+**Decision rationale:**
+Cloudflare's primitive set (D1, R2, KV, Queues, Durable Objects, Workers AI, Secrets) maps almost exactly to ThagomizerClaw's needs. The platform handles scaling, global distribution, and secret encryption. No infrastructure management required.
 
-### Container Isolation
-- All agents run inside containers (lightweight Linux VMs)
-- Each agent invocation spawns a container with mounted directories
-- Containers provide filesystem isolation - agents can only see mounted paths
-- Bash access is safe because commands run inside the container, not on the host
-- Browser automation via agent-browser with Chromium in the container
+### Decision: Direct Anthropic API over Agent SDK
 
-### Scheduled Tasks
-- Users can ask Claude to schedule recurring or one-time tasks from any group
-- Tasks run as full agents in the context of the group that created them
-- Tasks have access to all tools including Bash (safe in container)
-- Tasks can optionally send messages to their group via `send_message` tool, or complete silently
-- Task runs are logged to the database with duration and result
-- Schedule types: cron expressions, intervals (ms), or one-time (ISO timestamp)
-- From main: can schedule tasks for any group, view/manage all tasks
-- From other groups: can only manage that group's tasks
+**Alternatives considered:**
+- Running Claude Agent SDK in Workers (not possible — requires Node.js filesystem APIs)
+- External container execution (breaks the serverless requirement)
 
-### Group Management
-- New groups are added explicitly via the main channel
-- Groups are registered in SQLite (via the main channel or IPC `register_group` command)
-- Each group gets a dedicated folder under `groups/`
-- Groups can have additional directories mounted via `containerConfig`
+**Decision rationale:**
+The Agent SDK requires a Node.js environment with filesystem access for session storage. Workers are V8 isolates with no filesystem. The Messages API is the correct integration point for Workers.
 
-### Main Channel Privileges
-- Main channel is the admin/control group (typically self-chat)
-- Can write to global memory (`groups/CLAUDE.md`)
-- Can schedule tasks for any group
-- Can view and manage tasks from all groups
-- Can configure additional directory mounts for any group
+Trade-off: Workers mode agents do not have tool access (Bash, file operations). The agent is Claude responding to messages, not Claude Code running commands. For users who need tool access, the Node.js reference implementation is available.
 
----
+### Decision: D1 over KV-only or Postgres
 
-## Integration Points
+**Alternatives considered:**
+- Pure KV storage (no relational queries)
+- Cloudflare Hyperdrive + Postgres (requires external database)
 
-### WhatsApp
-- Using baileys library for WhatsApp Web connection
-- Messages stored in SQLite, polled by router
-- QR code authentication during setup
+**Decision rationale:**
+D1 is SQLite-compatible, requires no external infrastructure, and supports the relational queries needed (messages by JID and timestamp range, tasks by status and next_run). The existing SQLite schema migrates with minimal changes.
 
-### Scheduler
-- Built-in scheduler runs on the host, spawns containers for task execution
-- Custom `nanoclaw` MCP server (inside container) provides scheduling tools
-- Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
-- Tasks stored in SQLite with run history
-- Scheduler loop checks for due tasks every minute
-- Tasks execute Claude Agent SDK in containerized group context
+### Decision: Durable Objects for Group State
 
-### Web Access
-- Built-in WebSearch and WebFetch tools
-- Standard Claude Agent SDK capabilities
+**Alternatives considered:**
+- KV for all state (no consistency guarantees)
+- D1 for locking (complex advisory lock pattern)
+- External Redis (breaks serverless requirement)
 
-### Browser Automation
-- agent-browser CLI with Chromium in container
-- Snapshot-based interaction with element references (@e1, @e2, etc.)
-- Screenshots, PDFs, video recording
-- Authentication state persistence
+**Decision rationale:**
+Durable Objects provide strong consistency (single-instance globally) and the Alarm API for deferred processing. They are the correct Cloudflare primitive for per-entity stateful coordination.
+
+### Decision: Queues for Async Decoupling
+
+**Alternatives considered:**
+- Synchronous agent execution in fetch handler (violates 3s timeout)
+- Scheduled polling (adds latency, wastes resources)
+- Durable Object alarms only (no retry/DLQ support)
+
+**Decision rationale:**
+Queues provide: decoupling of webhook from execution, automatic retry with configurable max_retries, dead-letter queue for debugging, and batching for efficiency.
+
+### Decision: R2 for Group Files, KV for Hot State
+
+**Alternatives considered:**
+- D1 for all storage (BLOBs in SQLite — works but suboptimal)
+- KV for everything (no TTL control, expensive for large values)
+
+**Decision rationale:**
+R2 is designed for object storage and is cost-effective for CLAUDE.md files and logs. KV provides sub-millisecond read latency for frequently-accessed state (session IDs, cursors) that doesn't need SQL queries.
 
 ---
 
-## Setup & Customization
+## Preserved from NanoClaw
 
-### Philosophy
-- Minimal configuration files
-- Setup and customization done via Claude Code
-- Users clone the repo and run Claude Code to configure
-- Each user gets a custom setup matching their exact needs
+These design decisions from the original NanoClaw are preserved unchanged:
 
-### Skills
-- `/setup` - Install dependencies, authenticate WhatsApp, configure scheduler, start services
-- `/customize` - General-purpose skill for adding capabilities (new channels like Telegram, new integrations, behavior changes)
-- `/update` - Pull upstream changes, merge with customizations, run migrations
-
-### Deployment
-- Runs on local Mac via launchd
-- Single Node.js process handles everything
+- **JID-based group identification** — each chat is identified by a platform-specific JID
+- **CLAUDE.md hierarchy** — global CLAUDE.md (shared, read-only for non-main) and per-group CLAUDE.md
+- **Main group privileges** — one group has elevated access (admin, task management for all groups)
+- **Trigger pattern** — `@{ASSISTANT_NAME}` prefix required to activate agent (configurable)
+- **Skills architecture** — capabilities added via Claude Code skills, not core commits
+- **XML message format** — `<messages><message sender="..." time="...">content</message></messages>`
+- **Database schema** — same tables (chats, messages, registered_groups, sessions, scheduled_tasks, task_run_logs)
 
 ---
 
-## Personal Configuration (Reference)
+## What Changed from NanoClaw
 
-These are the creator's settings, stored here for reference:
-
-- **Trigger**: `@Andy` (case insensitive)
-- **Response prefix**: `Andy:`
-- **Persona**: Default Claude (no custom personality)
-- **Main channel**: Self-chat (messaging yourself in WhatsApp)
+| NanoClaw | ThagomizerClaw |
+|----------|---------------|
+| Docker containers | Workers AI + Anthropic API |
+| better-sqlite3 (sync) | D1 (async) |
+| `groups/`, `data/` filesystem | R2 + KV |
+| `.env` file secrets | Cloudflare Secrets |
+| Polling loop (2s) | Webhooks + Queues |
+| Scheduler loop (60s) | Cron Triggers (1 min) |
+| IPC via filesystem | Durable Objects |
+| Credential proxy server | Native env binding |
+| Single-region Node.js | Global edge Workers |
+| `~/.config/nanoclaw/` | `wrangler.toml [vars]` + Secrets |
+| Container image: `nanoclaw-agent` | No container (direct API) |
 
 ---
 
-## Project Name
+## Out of Scope
 
-**NanoClaw** - A reference to Clawdbot (now OpenClaw).
+The following are explicitly out of scope for the Workers implementation:
+
+- **Bash/shell access for agents** — Workers have no shell. Users who need agent tool access should use the Node.js reference implementation.
+- **Browser automation** — No Chromium in Workers. This is a fundamental constraint of the platform.
+- **WhatsApp via Baileys** — Baileys requires a persistent WebSocket connection and filesystem. Workers are stateless. WhatsApp Business API (webhook-based) could be added as a skill.
+- **Per-group agent customization** — No agent-runner src copying. Each group uses the same agent configuration.
+
+---
+
+*ThagomizerClaw Requirements v1.0*
+*Eduardo Arana & Soda 🥤*
